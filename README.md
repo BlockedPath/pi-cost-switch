@@ -4,7 +4,7 @@ Pi extension that estimates **next-turn cost before** you change model or thinki
 
 Built-in `/model` and thinking controls only notify after the change. This extension owns a pre-change switch UX with:
 
-- **hit** — warm continuation at the observed cache hit rate (`~85% (assumed)` when unknown)
+- **hit** — warm continuation for the *current* model at the observed cache hit rate (`~85% (assumed)` when unknown); **n/a** for other models (prompt cache does not transfer)
 - **cold** — base uncached total through cache-write-premium upper bound
 - **tax** — extra cost from re-billing only the previous cacheable prefix
 
@@ -50,7 +50,7 @@ Reload after install:
 |---|---|
 | `/cost-switch [filter]` | Pick model + thinking with $ estimates, then apply |
 | `/cost-estimate [filter]` | Comparison table only (no switch) |
-| `/cost-switch status` | Toggle status-bar `next≈… · miss …` |
+| `/cost-switch status` | Toggle status-bar `next≈… · miss …` (in-memory only; resets on `/reload`) |
 | `/cost-switch help` | Quick help |
 
 ## Status bar
@@ -65,17 +65,17 @@ next≈$0.162 · miss $1.35 · hit ~85% (assumed)
 - **miss** — estimated base-cold total if the cache is lost
 - **hit** — rate used for the warm estimate (`72%` observed, or `~85% (assumed)` when unknown)
 
-Toggle with `/cost-switch status`.
+Toggle with `/cost-switch status`. The toggle is **in-memory only** — it resets to on after `/reload`.
 
 ## How estimates work
 
 | Field | Meaning |
 |---|---|
-| **hit** | Continue with observed session cache hit rate; shows `~85% (assumed)` when unknown (not `0%`) |
+| **hit** | Current model only: continue with observed session cache hit rate (`~85% (assumed)` when unknown). Other models show **n/a** — cache does not transfer across models/providers |
 | **cold** | Range: normal uncached total → cache-write premium upper bound |
 | **tax** | Extra vs cache-read for the previous cacheable prefix only |
 
-Model switches and reasoning changes are treated as **cache-miss risks**. Output/reasoning is a heuristic from session averages × thinking effort multipliers — not provider-exact.
+Model switches and reasoning changes are treated as **cache-miss risks**. List estimates clamp thinking to each candidate’s supported levels. Output/reasoning is a heuristic from session averages × thinking effort multipliers — not provider-exact.
 
 Subscription / zero-priced models show **`sub`** instead of `$0.00`.
 

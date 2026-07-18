@@ -5,9 +5,12 @@ import {
 	type CostRates,
 	type ModelLike,
 	type PromptShape,
+	type ThinkingLevel,
 	baseColdInputCost,
 	cacheTax,
 	cacheableFromUsage,
+	clampThinkingToSupported,
+	estimateDescription,
 	estimateTurn,
 	expectedOutputTokens,
 	hitInputCost,
@@ -295,6 +298,97 @@ describe("isPriced / estimateTurn priced flag", () => {
 	});
 });
 
+describe("cross-model warm-hit policy (#3)", () => {
+	it("default estimateTurn keeps warm hit below cold", () => {
+		const est = estimateTurn(model({ id: "m" }), shape({ hitRate: 0.9 }), "medium", "medium");
+		assert.ok(est.hit < est.coldBase);
+		assert.equal(est.inputHit, hitInputCost(10_000, 0.9, BASE_RATES));
+	});
+
+	it("assumeWarmCache:false forces hit = coldBase (no transferable cache)", () => {
+		const warm = estimateTurn(model({ id: "m" }), shape({ hitRate: 0.9 }), "medium", "medium");
+		const cold = estimateTurn(model({ id: "m" }), shape({ hitRate: 0.9 }), "medium", "medium", {
+			assumeWarmCache: false,
+		});
+		assert.equal(cold.hit, cold.coldBase);
+		assert.equal(cold.inputHit, cold.inputColdBase);
+		assert.ok(cold.hit > warm.hit);
+		// Output / tax unchanged by cache-transfer policy
+		assert.equal(cold.output, warm.output);
+		assert.equal(cold.taxBase, warm.taxBase);
+	});
+
+	it("estimateDescription shows n/a hit when warmHit:false", () => {
+		const est = estimateTurn(model({ id: "m" }), shape(), "medium", "medium", {
+			assumeWarmCache: false,
+		});
+		const desc = estimateDescription(est, { emphasizeCold: true, warmHit: false });
+		assert.match(desc, /^n\/a hit · /);
+		assert.match(desc, /cold ← risk/);
+		assert.doesNotMatch(desc, /\$[\d.]+ hit/);
+	});
+
+	it("estimateDescription still shows $ hit for current/warm path", () => {
+		const est = estimateTurn(model({ id: "m" }), shape(), "medium", "medium");
+		const desc = estimateDescription(est);
+		assert.match(desc, /\$[\d.]+ hit/);
+		assert.doesNotMatch(desc, /n\/a hit/);
+	});
+});
+
+describe("clampThinkingToSupported (#4)", () => {
+	it("keeps supported level unchanged", () => {
+		assert.equal(clampThinkingToSupported("high", ["off", "low", "medium", "high"]), "high");
+	});
+
+	it("clamps unsupported high down to nearest available", () => {
+		// Prefer nearest at-or-above, then below — high not supported → xhigh missing → medium
+		assert.equal(clampThinkingToSupported("high", ["off", "low", "medium"]), "medium");
+	});
+
+	it("non-reasoning models only support off", () => {
+		assert.equal(clampThinkingToSupported("xhigh", ["off"]), "off");
+		assert.equal(clampThinkingToSupported("medium", ["off"]), "off");
+	});
+
+	it("empty supported list falls back to off", () => {
+		assert.equal(clampThinkingToSupported("high", []), "off");
+	});
+
+	it("estimate with clamped thinking reduces expectedOut vs unsupported high", () => {
+		const s = shape({ avgOutput: 1800, outputSamples: 4 });
+		const supported: ThinkingLevel[] = ["off", "low", "medium"];
+		const requested: ThinkingLevel = "high";
+		const clamped = clampThinkingToSupported(requested, supported);
+		assert.equal(clamped, "medium");
+
+		const unclamped = estimateTurn(model({ id: "m" }), s, requested, "medium");
+		const clampedEst = estimateTurn(model({ id: "m" }), s, clamped, "medium");
+		assert.ok(clampedEst.expectedOut < unclamped.expectedOut);
+		assert.equal(clampedEst.expectedOut, expectedOutputTokens(s, "medium", "medium"));
+	});
+});
+
+describe("estimateDescription tax label (#7)", () => {
+	it("priced models keep tax +$ prefix", () => {
+		const est = estimateTurn(model({ id: "m" }), shape(), "medium", "medium");
+		const desc = estimateDescription(est);
+		assert.match(desc, /tax \+\$/);
+	});
+
+	it("unpriced models use tax sub without +", () => {
+		const est = estimateTurn(
+			model({ id: "sub", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+			shape(),
+			"medium",
+			"medium",
+		);
+		const desc = estimateDescription(est);
+		assert.match(desc, /tax sub/);
+		assert.doesNotMatch(desc, /tax \+sub/);
+	});
+});
+
 describe("format helpers", () => {
 	it("formatTokens buckets", () => {
 		assert.equal(formatTokens(0), "0");
@@ -309,6 +403,7 @@ describe("format helpers", () => {
 		assert.equal(formatUsdRange(1, 2, false), "sub");
 		assert.equal(formatUsd(0, true), "$0");
 		assert.equal(formatUsd(0.0004, true), "$0.0004");
+		assert.equal(formatUsd(0.005, true), "$0.005"); // former <0.01 branch, same 3dp as <1
 		assert.equal(formatUsd(0.5, true), "$0.500");
 		assert.equal(formatUsd(1.5, true), "$1.50");
 	});

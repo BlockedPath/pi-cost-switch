@@ -17,7 +17,7 @@
  */
 
 import type { Api, AssistantMessage, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	DynamicBorder,
@@ -56,9 +56,11 @@ function toApiThinking(level: ThinkingLevel): ModelThinkingLevel {
 // Re-export pure helpers for tests / external consumers.
 export {
 	EFFORT_MULT,
+	THINKING_LEVEL_ORDER,
 	baseColdInputCost,
 	cacheTax,
 	cacheableFromUsage,
+	clampThinkingToSupported,
 	estimateDescription,
 	estimateTurn,
 	expectedOutputTokens,
@@ -77,7 +79,15 @@ export {
 	resolveHitRate,
 } from "./hit-rate.ts";
 export { rankModels } from "./rank.ts";
-export type { CostRates, ModelLike, PromptShape, ThinkingLevel, TurnEstimate } from "./estimate.ts";
+export type {
+	CostRates,
+	EstimateDescriptionOptions,
+	EstimateTurnOptions,
+	ModelLike,
+	PromptShape,
+	ThinkingLevel,
+	TurnEstimate,
+} from "./estimate.ts";
 
 interface Candidate {
 	model: Model<Api>;
@@ -179,16 +189,26 @@ function buildCandidates(
 	const ranked = rankModels(models, current, filter).slice(0, limit);
 	return ranked.map((model) => {
 		const isCurrent = !!current && model.provider === current.provider && model.id === current.id;
-		const estimate = estimateTurn(model, shape, thinking, thinking);
+		// Clamp session thinking to what this candidate actually supports (#4).
+		const clampedThinking = asThinking(clampThinkingLevel(model, toApiThinking(thinking)));
+		// Non-current models do not retain prompt cache — hit is cold / n/a (#3).
+		const estimate = estimateTurn(model, shape, clampedThinking, thinking, {
+			assumeWarmCache: isCurrent,
+		});
 		const label = isCurrent ? `${model.provider}/${model.id} (current)` : `${model.provider}/${model.id}`;
 		const rates = resolveRates(model, shape.nextTokens);
 		const rateBit = isPriced(rates)
 			? `in $${rates.input}/M out $${rates.output}/M`
 			: "subscription / unpriced";
+		const thinkNote =
+			!isCurrent && clampedThinking !== thinking ? ` · est@${clampedThinking}` : "";
 		return {
 			model,
 			label,
-			description: `${estimateDescription(estimate, { emphasizeCold: !isCurrent })} · ${rateBit}`,
+			description: `${estimateDescription(estimate, {
+				emphasizeCold: !isCurrent,
+				warmHit: isCurrent,
+			})}${thinkNote} · ${rateBit}`,
 			estimate,
 			isCurrent,
 		};
@@ -202,12 +222,16 @@ async function showSelectList(
 	items: SelectItem[],
 ): Promise<string | null> {
 	if (ctx.mode !== "tui" || !ctx.hasUI) {
-		// Fallback for non-TUI: plain select of labels.
-		const labels = items.map((i) => `${i.label} — ${i.description ?? ""}`);
+		// Non-TUI fallback: number options and resolve by index so identical
+		// "label — description" rows cannot collide onto the wrong value.
+		const labels = items.map((item, index) => {
+			const desc = item.description ? ` — ${item.description}` : "";
+			return `${index + 1}. ${item.label}${desc}`;
+		});
 		const picked = await ctx.ui.select(title, labels);
 		if (!picked) return null;
-		const idx = labels.indexOf(picked);
-		return idx >= 0 ? items[idx].value : null;
+		const index = labels.indexOf(picked);
+		return index >= 0 ? items[index]!.value : null;
 	}
 
 	return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
@@ -314,9 +338,11 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			"Next-turn cost estimate (heuristic)",
 			summarizeShape(shape, ctx.model, thinking),
 			"",
-			`hit = warm continuation at observed cache hit rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
+			`hit = warm continuation for the *current* model (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
+			"hit = n/a for other models (prompt cache does not transfer across models/providers)",
 			"cold = base uncached total through cache-write-premium upper bound",
 			"tax = extra cost from re-billing only the previous cacheable prefix",
+			"thinking is clamped per model to its supported levels",
 			"output = session-average output scaled by thinking effort",
 			"",
 		];
@@ -404,17 +430,13 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 		const switchingModel =
 			!ctx.model || model.provider !== ctx.model.provider || model.id !== ctx.model.id;
 		const levels = getSupportedThinkingLevels(model).map(asThinking);
-		let nextThinking: ThinkingLevel = currentThinking;
+		// Prefer pi-ai clamp over ad-hoc medium/low/first fallbacks (#4 / #7).
+		let nextThinking = asThinking(clampThinkingLevel(model, toApiThinking(currentThinking)));
 		if (levels.length > 1) {
-			if (!levels.includes(nextThinking)) {
-				nextThinking = levels.includes("medium")
-					? "medium"
-					: levels.includes("low")
-						? "low"
-						: levels[0];
-			}
 			const thinkingItems: SelectItem[] = levels.map((level) => {
-				const est = estimateTurn(model, shape, level, currentThinking);
+				const est = estimateTurn(model, shape, level, currentThinking, {
+					assumeWarmCache: !switchingModel,
+				});
 				const isCur =
 					model.provider === ctx.model?.provider &&
 					model.id === ctx.model?.id &&
@@ -423,7 +445,10 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 				return {
 					value: level,
 					label: isCur ? `${level} (current)` : level,
-					description: estimateDescription(est, { emphasizeCold: cacheRisk }),
+					description: estimateDescription(est, {
+						emphasizeCold: cacheRisk,
+						warmHit: !switchingModel,
+					}),
 				};
 			});
 
@@ -437,11 +462,12 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			);
 			if (!levelPicked) return;
 			nextThinking = asThinking(levelPicked);
-		} else {
-			nextThinking = levels[0] ?? "off";
 		}
 
-		const finalEst = estimateTurn(model, shape, nextThinking, currentThinking);
+
+		const finalEst = estimateTurn(model, shape, nextThinking, currentThinking, {
+			assumeWarmCache: !switchingModel,
+		});
 		const changingThinking = nextThinking !== currentThinking;
 		const cacheRisk = switchingModel || changingThinking;
 
@@ -490,12 +516,13 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 					[
 						"/cost-switch [filter]  — pick model + thinking with $ estimates",
 						"/cost-estimate [filter] — comparison table only",
-						"/cost-switch status   — toggle status-bar next≈ estimate",
+						"/cost-switch status   — toggle status-bar next≈ estimate (in-memory; lost on /reload)",
 						"",
-						`hit = warm continuation at observed rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
+						`hit = warm continuation for the *current* model (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
+						"hit = n/a for other models (prompt cache does not transfer)",
 						"cold = base-to-write-premium total",
 						"tax = re-bill cost for the previous cacheable prefix",
-						"model/reasoning changes are treated as cache-miss risks",
+						"thinking is clamped per model; model/reasoning changes are cache-miss risks",
 						"output scales from session averages × thinking effort",
 					].join("\n"),
 					"info",
