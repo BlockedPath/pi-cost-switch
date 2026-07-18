@@ -21,7 +21,7 @@ import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
-
+import { DEFAULT_ASSUMED_HIT_RATE, formatHitRateDisplay, resolveHitRate } from "./hit-rate.ts";
 type ThinkingLevel = ModelThinkingLevel;
 
 /** Rough output-token multipliers relative to a "medium" baseline turn. */
@@ -47,7 +47,7 @@ interface PromptShape {
 	nextTokens: number;
 	/** Previous request prompt tokens that could be re-billed on a miss. */
 	cacheableTokens: number;
-	/** Recent cache hit rate 0..1 (0 if unknown). */
+	/** Observed recent cache hit rate 0..1 (0 if unknown / no cache reads). */
 	hitRate: number;
 	/** Last assistant output tokens (for reasoning heuristic). */
 	lastOutput: number;
@@ -108,12 +108,6 @@ function formatUsdRange(min: number, max: number, priced: boolean): string {
 	if (Math.abs(high - low) < 0.0005) return formatUsd(high, true);
 	return `${formatUsd(low, true)}–${formatUsd(high, true)}`;
 }
-
-function formatPct(rate: number): string {
-	if (!Number.isFinite(rate) || rate <= 0) return "0%";
-	return `${(rate * 100).toFixed(0)}%`;
-}
-
 function modelKey(model: Model<Api> | undefined): string {
 	if (!model) return "none";
 	return `${model.provider}/${model.id}`;
@@ -164,11 +158,11 @@ function cacheTax(cacheableTokens: number, paidRate: number, readRate: number): 
 }
 
 /**
- * Hit input: apply recent hit rate; residual at uncached input.
- * If hit rate unknown, assume 85% for same-model continues (optimistic but common in coding sessions).
+ * Hit input: apply resolved hit rate; residual at uncached input.
+ * Observed 0 is unknown — resolveHitRate assumes DEFAULT_ASSUMED_HIT_RATE.
  */
 function hitInputCost(promptTokens: number, hitRate: number, rates: CostRates): number {
-	const rate = hitRate > 0 ? Math.min(0.99, hitRate) : 0.85;
+	const { rate } = resolveHitRate(hitRate);
 	const cached = Math.floor(promptTokens * rate);
 	const uncached = Math.max(0, promptTokens - cached);
 	return (cached * rates.cacheRead + uncached * rates.input) / 1_000_000;
@@ -377,7 +371,7 @@ function summarizeShape(shape: PromptShape, current: Model<Api> | undefined, thi
 	const curBit = cur
 		? `current ${formatUsd(cur.hit, cur.priced)} hit / ${formatUsdRange(cur.coldBase, cur.coldWrite, cur.priced)} cold`
 		: "no model";
-	return `next ${formatTokens(shape.nextTokens)} · cacheable ${formatTokens(shape.cacheableTokens)} · hit ${formatPct(shape.hitRate)} · think ${thinking} · ${curBit}`;
+	return `next ${formatTokens(shape.nextTokens)} · cacheable ${formatTokens(shape.cacheableTokens)} · hit ${formatHitRateDisplay(shape.hitRate)} · think ${thinking} · ${curBit}`;
 }
 
 export default function costSwitchExtension(pi: ExtensionAPI) {
@@ -398,7 +392,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 		const thinking = pi.getThinkingLevel();
 		const shape = collectPromptShape(ctx);
 		const est = estimateTurn(model, shape, thinking, thinking);
-		const text = `next≈${formatUsd(est.hit, est.priced)} · miss ${formatUsd(est.coldBase, est.priced)}`;
+		const text = `next≈${formatUsd(est.hit, est.priced)} · miss ${formatUsd(est.coldBase, est.priced)} · hit ${formatHitRateDisplay(shape.hitRate)}`;
 		ctx.ui.setStatus("cost-switch", ctx.ui.theme.fg("dim", text));
 	}
 
@@ -416,7 +410,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			"Next-turn cost estimate (heuristic)",
 			summarizeShape(shape, ctx.model, thinking),
 			"",
-			"hit = warm continuation using the recent cache hit rate",
+			`hit = warm continuation at observed cache hit rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
 			"cold = base uncached total through cache-write-premium upper bound",
 			"tax = extra cost from re-billing only the previous cacheable prefix",
 			"output = session-average output scaled by thinking effort",
@@ -594,7 +588,8 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 						"/cost-estimate [filter] — comparison table only",
 						"/cost-switch status   — toggle status-bar next≈ estimate",
 						"",
-						"hit = warm continuation; cold = base-to-write-premium total",
+						`hit = warm continuation at observed rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
+						"cold = base-to-write-premium total",
 						"tax = re-bill cost for the previous cacheable prefix",
 						"model/reasoning changes are treated as cache-miss risks",
 						"output scales from session averages × thinking effort",
