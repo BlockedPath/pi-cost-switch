@@ -15,7 +15,6 @@ export function formatUsd(n: number, priced: boolean): string {
 	if (!Number.isFinite(n) || n < 0) return "?";
 	if (n === 0) return "$0";
 	if (n < 0.001) return `$${n.toFixed(4)}`;
-	if (n < 0.01) return `$${n.toFixed(3)}`;
 	if (n < 1) return `$${n.toFixed(3)}`;
 	return `$${n.toFixed(2)}`;
 }

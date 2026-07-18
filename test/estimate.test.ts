@@ -403,6 +403,7 @@ describe("format helpers", () => {
 		assert.equal(formatUsdRange(1, 2, false), "sub");
 		assert.equal(formatUsd(0, true), "$0");
 		assert.equal(formatUsd(0.0004, true), "$0.0004");
+		assert.equal(formatUsd(0.005, true), "$0.005"); // former <0.01 branch, same 3dp as <1
 		assert.equal(formatUsd(0.5, true), "$0.500");
 		assert.equal(formatUsd(1.5, true), "$1.50");
 	});

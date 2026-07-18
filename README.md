@@ -50,7 +50,7 @@ Reload after install:
 |---|---|
 | `/cost-switch [filter]` | Pick model + thinking with $ estimates, then apply |
 | `/cost-estimate [filter]` | Comparison table only (no switch) |
-| `/cost-switch status` | Toggle status-bar `next≈… · miss …` |
+| `/cost-switch status` | Toggle status-bar `next≈… · miss …` (in-memory only; resets on `/reload`) |
 | `/cost-switch help` | Quick help |
 
 ## Status bar
@@ -65,7 +65,7 @@ next≈$0.162 · miss $1.35 · hit ~85% (assumed)
 - **miss** — estimated base-cold total if the cache is lost
 - **hit** — rate used for the warm estimate (`72%` observed, or `~85% (assumed)` when unknown)
 
-Toggle with `/cost-switch status`.
+Toggle with `/cost-switch status`. The toggle is **in-memory only** — it resets to on after `/reload`.
 
 ## How estimates work
 
