@@ -202,12 +202,16 @@ async function showSelectList(
 	items: SelectItem[],
 ): Promise<string | null> {
 	if (ctx.mode !== "tui" || !ctx.hasUI) {
-		// Fallback for non-TUI: plain select of labels.
-		const labels = items.map((i) => `${i.label} — ${i.description ?? ""}`);
+		// Non-TUI fallback: number options and resolve by index so identical
+		// "label — description" rows cannot collide onto the wrong value.
+		const labels = items.map((item, index) => {
+			const desc = item.description ? ` — ${item.description}` : "";
+			return `${index + 1}. ${item.label}${desc}`;
+		});
 		const picked = await ctx.ui.select(title, labels);
 		if (!picked) return null;
-		const idx = labels.indexOf(picked);
-		return idx >= 0 ? items[idx].value : null;
+		const index = labels.indexOf(picked);
+		return index >= 0 ? items[index]!.value : null;
 	}
 
 	return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
@@ -490,7 +494,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 					[
 						"/cost-switch [filter]  — pick model + thinking with $ estimates",
 						"/cost-estimate [filter] — comparison table only",
-						"/cost-switch status   — toggle status-bar next≈ estimate",
+						"/cost-switch status   — toggle status-bar next≈ estimate (in-memory; lost on /reload)",
 						"",
 						`hit = warm continuation at observed rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
 						"cold = base-to-write-premium total",
