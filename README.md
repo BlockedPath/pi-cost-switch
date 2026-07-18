@@ -83,14 +83,27 @@ Subscription / zero-priced models show **`sub`** instead of `$0.00`.
 
 ```text
 pi-cost-switch/
-├── package.json          # pi-package manifest
+├── package.json          # pi-package manifest + test script
 ├── README.md
 ├── LICENSE
+├── test/
+│   ├── estimate.test.ts  # pure cost helper unit tests (node:test)
+│   └── hit-rate.test.ts  # observed vs assumed hit-rate policy
 └── extensions/
     └── cost-switch/
         ├── index.ts      # extension entrypoint
+        ├── estimate.ts   # pure cost math
+        ├── format.ts     # pure $ / token formatters
         ├── hit-rate.ts   # observed vs assumed hit-rate policy
-        └── hit-rate.test.ts
+        └── rank.ts       # pure model filter/rank
+```
+
+### Tests
+
+```bash
+npm test
+# or:
+node --test --experimental-strip-types test/**/*.test.ts
 ```
 
 Local auto-discovery (optional): symlink into the global extensions tree:

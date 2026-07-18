@@ -5,7 +5,7 @@ import {
 	MAX_HIT_RATE,
 	formatHitRateDisplay,
 	resolveHitRate,
-} from "./hit-rate.ts";
+} from "../extensions/cost-switch/hit-rate.ts";
 
 describe("resolveHitRate", () => {
 	it("assumes the default rate when observed is 0 / unknown", () => {
