@@ -1,0 +1,36 @@
+{
+  "name": "pi-cost-switch",
+  "version": "0.1.0",
+  "description": "Pi extension: preview next-turn model/thinking cost with hit, cold, and cache-tax estimates before switching",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "cost",
+    "prompt-cache",
+    "model-switch"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/cost-switch"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BlockedPath/pi-cost-switch.git"
+  }
+}
