@@ -19,61 +19,65 @@
 import type { Api, AssistantMessage, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import {
+	DynamicBorder,
+	estimateTokens,
+	sessionEntryToContextMessages,
+} from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 
-type ThinkingLevel = ModelThinkingLevel;
+import {
+	type PromptShape,
+	type ThinkingLevel,
+	type TurnEstimate,
+	estimateDescription,
+	estimateTurn,
+	isPriced,
+	modelKey,
+	resolveRates,
+} from "./estimate.ts";
+import { formatTokens, formatUsd, formatUsdRange } from "./format.ts";
+import {
+	DEFAULT_ASSUMED_HIT_RATE,
+	formatHitRateDisplay,
+} from "./hit-rate.ts";
+import { rankModels } from "./rank.ts";
 
-/** Rough output-token multipliers relative to a "medium" baseline turn. */
-const EFFORT_MULT: Record<ThinkingLevel, number> = {
-	off: 0.7,
-	minimal: 0.9,
-	low: 1.2,
-	medium: 1.8,
-	high: 3.5,
-	xhigh: 6.5,
-	max: 11,
-};
-
-interface CostRates {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
+/** Bridge pi ModelThinkingLevel into our effort-multiplier union (includes "max"). */
+function asThinking(level: ModelThinkingLevel | string): ThinkingLevel {
+	return level as ThinkingLevel;
 }
 
-interface PromptShape {
-	/** Estimated total input tokens for the next request. */
-	nextTokens: number;
-	/** Previous request prompt tokens that could be re-billed on a miss. */
-	cacheableTokens: number;
-	/** Recent cache hit rate 0..1 (0 if unknown). */
-	hitRate: number;
-	/** Last assistant output tokens (for reasoning heuristic). */
-	lastOutput: number;
-	/** Rolling average assistant output tokens in this session. */
-	avgOutput: number;
-	/** Sample count for avgOutput. */
-	outputSamples: number;
+/** Bridge back to the API type accepted by setThinkingLevel. */
+function toApiThinking(level: ThinkingLevel): ModelThinkingLevel {
+	return level as ModelThinkingLevel;
 }
 
-interface TurnEstimate {
-	hit: number;
-	/** Full next request at normal uncached-input pricing. */
-	coldBase: number;
-	/** Full next request if the provider charges its cache-write premium. */
-	coldWrite: number;
-	/** Extra cost vs cached reads for the previously cacheable prefix. */
-	taxBase: number;
-	/** Extra cost vs cached reads if the prefix is billed at cache-write pricing. */
-	taxWrite: number;
-	inputHit: number;
-	inputColdBase: number;
-	inputColdWrite: number;
-	output: number;
-	expectedOut: number;
-	priced: boolean;
-}
+// Re-export pure helpers for tests / external consumers.
+export {
+	EFFORT_MULT,
+	baseColdInputCost,
+	cacheTax,
+	cacheableFromUsage,
+	estimateDescription,
+	estimateTurn,
+	expectedOutputTokens,
+	hitInputCost,
+	hitRateFromUsage,
+	isPriced,
+	modelKey,
+	resolveRates,
+	writeColdInputCost,
+} from "./estimate.ts";
+export { formatPct, formatTokens, formatUsd, formatUsdRange } from "./format.ts";
+export {
+	DEFAULT_ASSUMED_HIT_RATE,
+	MAX_HIT_RATE,
+	formatHitRateDisplay,
+	resolveHitRate,
+} from "./hit-rate.ts";
+export { rankModels } from "./rank.ts";
+export type { CostRates, ModelLike, PromptShape, ThinkingLevel, TurnEstimate } from "./estimate.ts";
 
 interface Candidate {
 	model: Model<Api>;
@@ -83,138 +87,30 @@ interface Candidate {
 	isCurrent: boolean;
 }
 
-function formatTokens(n: number): string {
-	if (!Number.isFinite(n) || n <= 0) return "0";
-	if (n < 1000) return String(Math.round(n));
-	if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
-	if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
-	return `${(n / 1_000_000).toFixed(2)}M`;
-}
-
-function formatUsd(n: number, priced: boolean): string {
-	if (!priced) return "sub";
-	if (!Number.isFinite(n) || n < 0) return "?";
-	if (n === 0) return "$0";
-	if (n < 0.001) return `$${n.toFixed(4)}`;
-	if (n < 0.01) return `$${n.toFixed(3)}`;
-	if (n < 1) return `$${n.toFixed(3)}`;
-	return `$${n.toFixed(2)}`;
-}
-
-function formatUsdRange(min: number, max: number, priced: boolean): string {
-	if (!priced) return "sub";
-	const low = Math.min(min, max);
-	const high = Math.max(min, max);
-	if (Math.abs(high - low) < 0.0005) return formatUsd(high, true);
-	return `${formatUsd(low, true)}–${formatUsd(high, true)}`;
-}
-
-function formatPct(rate: number): string {
-	if (!Number.isFinite(rate) || rate <= 0) return "0%";
-	return `${(rate * 100).toFixed(0)}%`;
-}
-
-function modelKey(model: Model<Api> | undefined): string {
-	if (!model) return "none";
-	return `${model.provider}/${model.id}`;
-}
-
-function resolveRates(model: Model<Api>, promptTokens: number): CostRates {
-	const cost = model.cost;
-	let rates: CostRates = {
-		input: cost.input ?? 0,
-		output: cost.output ?? 0,
-		cacheRead: cost.cacheRead ?? 0,
-		cacheWrite: cost.cacheWrite ?? 0,
-	};
-	let matched = -1;
-	for (const tier of cost.tiers ?? []) {
-		const above = tier.inputTokensAbove ?? 0;
-		if (promptTokens > above && above > matched) {
-			rates = {
-				input: tier.input ?? rates.input,
-				output: tier.output ?? rates.output,
-				cacheRead: tier.cacheRead ?? rates.cacheRead,
-				cacheWrite: tier.cacheWrite ?? rates.cacheWrite,
-			};
-			matched = above;
-		}
-	}
-	return rates;
-}
-
-function isPriced(rates: CostRates): boolean {
-	return rates.input > 0 || rates.output > 0 || rates.cacheRead > 0 || rates.cacheWrite > 0;
-}
-
-/** Full next request input at normal uncached-input pricing. */
-function baseColdInputCost(promptTokens: number, rates: CostRates): number {
-	return (promptTokens * rates.input) / 1_000_000;
-}
-
-/** Full next request input if a provider applies its cache-write premium. */
-function writeColdInputCost(promptTokens: number, rates: CostRates): number {
-	const writeRate = Math.max(rates.input, rates.cacheWrite);
-	return (promptTokens * writeRate) / 1_000_000;
-}
-
-/** Extra input cost when a previously cacheable prefix is re-billed. */
-function cacheTax(cacheableTokens: number, paidRate: number, readRate: number): number {
-	return (cacheableTokens * Math.max(0, paidRate - readRate)) / 1_000_000;
-}
-
 /**
- * Hit input: apply recent hit rate; residual at uncached input.
- * If hit rate unknown, assume 85% for same-model continues (optimistic but common in coding sessions).
+ * Rough token estimate for the LLM-visible context path.
+ * Used when getContextUsage().tokens is null (right after compaction,
+ * before the next assistant response has trustworthy usage).
  */
-function hitInputCost(promptTokens: number, hitRate: number, rates: CostRates): number {
-	const rate = hitRate > 0 ? Math.min(0.99, hitRate) : 0.85;
-	const cached = Math.floor(promptTokens * rate);
-	const uncached = Math.max(0, promptTokens - cached);
-	return (cached * rates.cacheRead + uncached * rates.input) / 1_000_000;
-}
-
-function expectedOutputTokens(shape: PromptShape, fromLevel: ThinkingLevel, toLevel: ThinkingLevel): number {
-	const base = shape.avgOutput > 0 ? shape.avgOutput : shape.lastOutput > 0 ? shape.lastOutput : 800;
-	const fromMult = EFFORT_MULT[fromLevel] ?? 1.8;
-	const toMult = EFFORT_MULT[toLevel] ?? 1.8;
-	// Scale relative to current level's observed output when we have samples.
-	const scaled = shape.outputSamples > 0 ? base * (toMult / fromMult) : base * (toMult / EFFORT_MULT.medium);
-	return Math.max(64, Math.round(scaled));
-}
-
-function estimateTurn(
-	model: Model<Api>,
-	shape: PromptShape,
-	thinking: ThinkingLevel,
-	currentThinking: ThinkingLevel,
-): TurnEstimate {
-	const rates = resolveRates(model, shape.nextTokens);
-	const priced = isPriced(rates);
-	const expectedOut = expectedOutputTokens(shape, currentThinking, thinking);
-	const inputHit = hitInputCost(shape.nextTokens, shape.hitRate, rates);
-	const inputColdBase = baseColdInputCost(shape.nextTokens, rates);
-	const inputColdWrite = writeColdInputCost(shape.nextTokens, rates);
-	const output = (expectedOut * rates.output) / 1_000_000;
-	const writeRate = Math.max(rates.input, rates.cacheWrite);
-	return {
-		hit: inputHit + output,
-		coldBase: inputColdBase + output,
-		coldWrite: inputColdWrite + output,
-		taxBase: cacheTax(shape.cacheableTokens, rates.input, rates.cacheRead),
-		taxWrite: cacheTax(shape.cacheableTokens, writeRate, rates.cacheRead),
-		inputHit,
-		inputColdBase,
-		inputColdWrite,
-		output,
-		expectedOut,
-		priced,
-	};
+function estimateActiveContextTokens(ctx: ExtensionContext): number {
+	try {
+		const entries = ctx.sessionManager.buildContextEntries();
+		let total = 0;
+		for (const entry of entries) {
+			for (const msg of sessionEntryToContextMessages(entry)) {
+				total += estimateTokens(msg);
+			}
+		}
+		return total;
+	} catch {
+		return 0;
+	}
 }
 
 function collectPromptShape(ctx: ExtensionContext): PromptShape {
 	const usage = ctx.getContextUsage();
-	let nextTokens = usage?.tokens && usage.tokens > 0 ? usage.tokens : 0;
+	// tokens may be null after compaction until the next LLM response.
+	let nextTokens = usage?.tokens != null && usage.tokens > 0 ? usage.tokens : 0;
 
 	let lastInput = 0;
 	let lastCacheRead = 0;
@@ -245,6 +141,16 @@ function collectPromptShape(ctx: ExtensionContext): PromptShape {
 	}
 
 	let cacheableTokens = lastInput + lastCacheRead + lastCacheWrite;
+	// After compaction, last assistant usage is pre-compact and overstates size.
+	if (nextTokens <= 0 && usage?.tokens === null) {
+		const estimated = estimateActiveContextTokens(ctx);
+		if (estimated > 0) {
+			nextTokens = estimated;
+			// Compaction replaces the cached prefix with a new summary.
+			cacheableTokens = estimated;
+			lastCacheRead = 0;
+		}
+	}
 	if (nextTokens <= 0) nextTokens = cacheableTokens;
 	if (nextTokens <= 0) nextTokens = 4_000;
 	if (cacheableTokens <= 0) cacheableTokens = nextTokens;
@@ -260,38 +166,6 @@ function collectPromptShape(ctx: ExtensionContext): PromptShape {
 		avgOutput,
 		outputSamples,
 	};
-}
-
-function estimateDescription(est: TurnEstimate, opts?: { emphasizeCold?: boolean }): string {
-	const riskMark = opts?.emphasizeCold ? " ← risk" : "";
-	const cold = formatUsdRange(est.coldBase, est.coldWrite, est.priced);
-	const tax = formatUsdRange(est.taxBase, est.taxWrite, est.priced);
-	return `${formatUsd(est.hit, est.priced)} hit · ${cold} cold${riskMark} · tax +${tax} · ~${formatTokens(est.expectedOut)} out`;
-}
-
-function rankModels(models: Model<Api>[], current: Model<Api> | undefined, filter: string): Model<Api>[] {
-	const q = filter.trim().toLowerCase();
-	let list = models;
-	if (q) {
-		list = list.filter((m) => {
-			const hay = `${m.provider}/${m.id} ${m.name ?? ""}`.toLowerCase();
-			return hay.includes(q) || q.split(/\s+/).every((part) => hay.includes(part));
-		});
-	}
-
-	const currentProvider = current?.provider;
-	return [...list].sort((a, b) => {
-		const aCur = current && a.provider === current.provider && a.id === current.id ? 0 : 1;
-		const bCur = current && b.provider === current.provider && b.id === current.id ? 0 : 1;
-		if (aCur !== bCur) return aCur - bCur;
-		const aProv = currentProvider && a.provider === currentProvider ? 0 : 1;
-		const bProv = currentProvider && b.provider === currentProvider ? 0 : 1;
-		if (aProv !== bProv) return aProv - bProv;
-		const aCost = a.cost?.input ?? 0;
-		const bCost = b.cost?.input ?? 0;
-		if (aCost !== bCost) return aCost - bCost;
-		return `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`);
-	});
 }
 
 function buildCandidates(
@@ -377,13 +251,37 @@ function summarizeShape(shape: PromptShape, current: Model<Api> | undefined, thi
 	const curBit = cur
 		? `current ${formatUsd(cur.hit, cur.priced)} hit / ${formatUsdRange(cur.coldBase, cur.coldWrite, cur.priced)} cold`
 		: "no model";
-	return `next ${formatTokens(shape.nextTokens)} · cacheable ${formatTokens(shape.cacheableTokens)} · hit ${formatPct(shape.hitRate)} · think ${thinking} · ${curBit}`;
+	return `next ${formatTokens(shape.nextTokens)} · cacheable ${formatTokens(shape.cacheableTokens)} · hit ${formatHitRateDisplay(shape.hitRate)} · think ${thinking} · ${curBit}`;
 }
 
 export default function costSwitchExtension(pi: ExtensionAPI) {
 	let showStatus = true;
 	/** Suppress post-change toasts while /cost-switch applies model+thinking. */
 	let suppressNotices = false;
+	/** Bumped on each apply so a deferred release cannot clear a newer suppression window. */
+	let suppressToken = 0;
+
+	function beginSuppressNotices(): number {
+		const token = ++suppressToken;
+		suppressNotices = true;
+		return token;
+	}
+
+	/**
+	 * Release suppression after void-emitted thinking_level_select handlers can run.
+	 *
+	 * Pi awaits model_select but fire-and-forgets thinking_level_select:
+	 *   void this._extensionRunner.emit({ type: "thinking_level_select", ... })
+	 * setModel also clamps thinking via setThinkingLevel before model_select.
+	 * A macrotask is enough for those promise chains to observe suppressNotices.
+	 */
+	function endSuppressNotices(token: number): void {
+		setTimeout(() => {
+			if (suppressToken === token) {
+				suppressNotices = false;
+			}
+		}, 0);
+	}
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (!showStatus) {
@@ -395,10 +293,10 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			ctx.ui.setStatus("cost-switch", undefined);
 			return;
 		}
-		const thinking = pi.getThinkingLevel();
+		const thinking = asThinking(pi.getThinkingLevel());
 		const shape = collectPromptShape(ctx);
 		const est = estimateTurn(model, shape, thinking, thinking);
-		const text = `next≈${formatUsd(est.hit, est.priced)} · miss ${formatUsd(est.coldBase, est.priced)}`;
+		const text = `next≈${formatUsd(est.hit, est.priced)} · miss ${formatUsd(est.coldBase, est.priced)} · hit ${formatHitRateDisplay(shape.hitRate)}`;
 		ctx.ui.setStatus("cost-switch", ctx.ui.theme.fg("dim", text));
 	}
 
@@ -408,7 +306,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			ctx.ui.notify("No available models (check auth / model list)", "warning");
 			return;
 		}
-		const thinking = pi.getThinkingLevel();
+		const thinking = asThinking(pi.getThinkingLevel());
 		const shape = collectPromptShape(ctx);
 		const candidates = buildCandidates(models, ctx.model, shape, thinking, filter, 25);
 
@@ -416,7 +314,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			"Next-turn cost estimate (heuristic)",
 			summarizeShape(shape, ctx.model, thinking),
 			"",
-			"hit = warm continuation using the recent cache hit rate",
+			`hit = warm continuation at observed cache hit rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
 			"cold = base uncached total through cache-write-premium upper bound",
 			"tax = extra cost from re-billing only the previous cacheable prefix",
 			"output = session-average output scaled by thinking effort",
@@ -473,7 +371,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const currentThinking = pi.getThinkingLevel();
+		const currentThinking = asThinking(pi.getThinkingLevel());
 		const shape = collectPromptShape(ctx);
 		const candidates = buildCandidates(models, ctx.model, shape, currentThinking, filter, 50);
 		if (candidates.length === 0) {
@@ -505,7 +403,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 
 		const switchingModel =
 			!ctx.model || model.provider !== ctx.model.provider || model.id !== ctx.model.id;
-		const levels = getSupportedThinkingLevels(model);
+		const levels = getSupportedThinkingLevels(model).map(asThinking);
 		let nextThinking: ThinkingLevel = currentThinking;
 		if (levels.length > 1) {
 			if (!levels.includes(nextThinking)) {
@@ -538,7 +436,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 				thinkingItems,
 			);
 			if (!levelPicked) return;
-			nextThinking = levelPicked as ThinkingLevel;
+			nextThinking = asThinking(levelPicked);
 		} else {
 			nextThinking = levels[0] ?? "off";
 		}
@@ -547,16 +445,16 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 		const changingThinking = nextThinking !== currentThinking;
 		const cacheRisk = switchingModel || changingThinking;
 
-		suppressNotices = true;
+		const token = beginSuppressNotices();
 		try {
 			const ok = await pi.setModel(model);
 			if (!ok) {
 				ctx.ui.notify(`No API key / failed to set ${provider}/${modelId}`, "error");
 				return;
 			}
-			pi.setThinkingLevel(nextThinking);
+			pi.setThinkingLevel(toApiThinking(nextThinking));
 		} finally {
-			suppressNotices = false;
+			endSuppressNotices(token);
 		}
 
 		if (cacheRisk) {
@@ -594,7 +492,8 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 						"/cost-estimate [filter] — comparison table only",
 						"/cost-switch status   — toggle status-bar next≈ estimate",
 						"",
-						"hit = warm continuation; cold = base-to-write-premium total",
+						`hit = warm continuation at observed rate (or ~${(DEFAULT_ASSUMED_HIT_RATE * 100).toFixed(0)}% assumed when unknown)`,
+						"cold = base-to-write-premium total",
 						"tax = re-bill cost for the previous cacheable prefix",
 						"model/reasoning changes are treated as cache-miss risks",
 						"output scales from session averages × thinking effort",
@@ -620,7 +519,7 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 
 	pi.on("model_select", async (event, ctx) => {
 		// After built-in /model: show what the next turn is likely to cost now.
-		const thinking = pi.getThinkingLevel();
+		const thinking = asThinking(pi.getThinkingLevel());
 		const shape = collectPromptShape(ctx);
 		const next = estimateTurn(event.model, shape, thinking, thinking);
 		const prev = event.previousModel
@@ -640,7 +539,12 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 		const model = ctx.model;
 		if (!model) return;
 		const shape = collectPromptShape(ctx);
-		const next = estimateTurn(model, shape, event.level, event.previousLevel ?? event.level);
+		const next = estimateTurn(
+			model,
+			shape,
+			asThinking(event.level),
+			asThinking(event.previousLevel ?? event.level),
+		);
 		if (!suppressNotices) {
 			ctx.ui.notify(
 				`Thinking ${event.previousLevel ?? "?"} → ${event.level} · next≈ ${formatUsdRange(next.coldBase, next.coldWrite, next.priced)} cold-risk / ${formatUsd(next.hit, next.priced)} warm · tax +${formatUsdRange(next.taxBase, next.taxWrite, next.priced)} · ~${formatTokens(next.expectedOut)} out`,
@@ -654,5 +558,11 @@ export default function costSwitchExtension(pi: ExtensionAPI) {
 		if (event.message.role === "assistant") {
 			updateStatus(ctx);
 		}
+	});
+
+	// Refresh after compaction so next≈/miss reflect the shrunk context
+	// without waiting for the next assistant turn. Single fire (not streaming).
+	pi.on("session_compact", async (_event, ctx) => {
+		updateStatus(ctx);
 	});
 }
