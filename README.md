@@ -4,7 +4,7 @@ Pi extension that estimates **next-turn cost before** you change model or thinki
 
 Built-in `/model` and thinking controls only notify after the change. This extension owns a pre-change switch UX with:
 
-- **hit** — warm continuation using the recent cache hit rate
+- **hit** — warm continuation at the observed cache hit rate (`~85% (assumed)` when unknown)
 - **cold** — base uncached total through cache-write-premium upper bound
 - **tax** — extra cost from re-billing only the previous cacheable prefix
 
@@ -58,11 +58,12 @@ Reload after install:
 Shows something like:
 
 ```text
-next≈$0.162 · miss $1.35
+next≈$0.162 · miss $1.35 · hit ~85% (assumed)
 ```
 
 - **next≈** — estimated warm (cache-hit) next-turn total
 - **miss** — estimated base-cold total if the cache is lost
+- **hit** — rate used for the warm estimate (`72%` observed, or `~85% (assumed)` when unknown)
 
 Toggle with `/cost-switch status`.
 
@@ -70,7 +71,7 @@ Toggle with `/cost-switch status`.
 
 | Field | Meaning |
 |---|---|
-| **hit** | Continue with recent session cache hit rate (default ~85% if unknown) |
+| **hit** | Continue with observed session cache hit rate; shows `~85% (assumed)` when unknown (not `0%`) |
 | **cold** | Range: normal uncached total → cache-write premium upper bound |
 | **tax** | Extra vs cache-read for the previous cacheable prefix only |
 
@@ -87,7 +88,9 @@ pi-cost-switch/
 ├── LICENSE
 └── extensions/
     └── cost-switch/
-        └── index.ts      # extension entrypoint
+        ├── index.ts      # extension entrypoint
+        ├── hit-rate.ts   # observed vs assumed hit-rate policy
+        └── hit-rate.test.ts
 ```
 
 Local auto-discovery (optional): symlink into the global extensions tree:
