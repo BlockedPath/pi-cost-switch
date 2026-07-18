@@ -157,18 +157,65 @@ export function expectedOutputTokens(
 	return Math.max(64, Math.round(scaled));
 }
 
+/** Ordered thinking levels for pure clamp (mirrors pi-ai, plus local "max"). */
+export const THINKING_LEVEL_ORDER: ThinkingLevel[] = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
+
+/**
+ * Clamp a requested thinking level to a model's supported set.
+ * Pure mirror of pi-ai clampThinkingLevel for unit tests / fixtures.
+ */
+export function clampThinkingToSupported(
+	level: ThinkingLevel,
+	supported: readonly ThinkingLevel[],
+): ThinkingLevel {
+	if (supported.length === 0) return "off";
+	if (supported.includes(level)) return level;
+	const requestedIndex = THINKING_LEVEL_ORDER.indexOf(level);
+	if (requestedIndex === -1) return supported[0];
+	for (let i = requestedIndex; i < THINKING_LEVEL_ORDER.length; i++) {
+		const candidate = THINKING_LEVEL_ORDER[i];
+		if (supported.includes(candidate)) return candidate;
+	}
+	for (let i = requestedIndex - 1; i >= 0; i--) {
+		const candidate = THINKING_LEVEL_ORDER[i];
+		if (supported.includes(candidate)) return candidate;
+	}
+	return supported[0];
+}
+
+export interface EstimateTurnOptions {
+	/**
+	 * When false, hit cost equals cold (cache does not transfer across models).
+	 * Default true — warm continuation using session hit rate.
+	 */
+	assumeWarmCache?: boolean;
+}
+
 export function estimateTurn(
 	model: ModelLike,
 	shape: PromptShape,
 	thinking: ThinkingLevel,
 	currentThinking: ThinkingLevel,
+	opts?: EstimateTurnOptions,
 ): TurnEstimate {
 	const rates = resolveRates(model, shape.nextTokens);
 	const priced = isPriced(rates);
 	const expectedOut = expectedOutputTokens(shape, currentThinking, thinking);
-	const inputHit = hitInputCost(shape.nextTokens, shape.hitRate, rates);
 	const inputColdBase = baseColdInputCost(shape.nextTokens, rates);
 	const inputColdWrite = writeColdInputCost(shape.nextTokens, rates);
+	// Cross-model: prompt cache almost never transfers — treat hit as full cold.
+	const inputHit =
+		opts?.assumeWarmCache === false
+			? inputColdBase
+			: hitInputCost(shape.nextTokens, shape.hitRate, rates);
 	const output = (expectedOut * rates.output) / 1_000_000;
 	const writeRate = Math.max(rates.input, rates.cacheWrite);
 	return {
@@ -186,11 +233,23 @@ export function estimateTurn(
 	};
 }
 
-export function estimateDescription(est: TurnEstimate, opts?: { emphasizeCold?: boolean }): string {
+export interface EstimateDescriptionOptions {
+	emphasizeCold?: boolean;
+	/**
+	 * When false, show "n/a hit" instead of a warm $ (cache not transferable).
+	 * Default true.
+	 */
+	warmHit?: boolean;
+}
+
+export function estimateDescription(est: TurnEstimate, opts?: EstimateDescriptionOptions): string {
 	const riskMark = opts?.emphasizeCold ? " ← risk" : "";
 	const cold = formatUsdRange(est.coldBase, est.coldWrite, est.priced);
 	const tax = formatUsdRange(est.taxBase, est.taxWrite, est.priced);
-	return `${formatUsd(est.hit, est.priced)} hit · ${cold} cold${riskMark} · tax +${tax} · ~${formatTokens(est.expectedOut)} out`;
+	// Unpriced models format as "sub" — avoid "tax +sub".
+	const taxBit = est.priced ? `tax +${tax}` : `tax ${tax}`;
+	const hitBit = opts?.warmHit === false ? "n/a hit" : `${formatUsd(est.hit, est.priced)} hit`;
+	return `${hitBit} · ${cold} cold${riskMark} · ${taxBit} · ~${formatTokens(est.expectedOut)} out`;
 }
 
 /**
